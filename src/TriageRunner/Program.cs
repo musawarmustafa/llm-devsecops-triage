@@ -1,4 +1,5 @@
 using TriageRunner.Csv;
+using TriageRunner.Evaluation;
 using TriageRunner.Llm;
 using TriageRunner.Prompts;
 
@@ -11,13 +12,16 @@ namespace TriageRunner;
 /// Typical run:
 ///   1. dotnet run -- --mode zero-shot     (labeled_with_groundtruth.csv -> zero_shot_results.csv)
 ///   2. dotnet run -- --mode few-shot      (zero_shot_results.csv        -> few_shot_results.csv)
+///   3. dotnet run -- --mode evaluate      (few_shot_results.csv         -> metrics.csv)
 ///
-/// The second step adds a few-shot verdict column next to the zero-shot one.
-/// Requires the GROQ_API_KEY environment variable.
+/// Step 2 adds a few-shot verdict column next to the zero-shot one.
+/// Steps 1 and 2 need the GROQ_API_KEY environment variable. Step 3 runs offline.
 /// </summary>
 internal static class Program
 {
     private static readonly IPromptStrategy[] Strategies = { new ZeroShotPrompt(), new FewShotPrompt() };
+
+    private const string EvaluateMode = "evaluate";
 
     private static async Task<int> Main(string[] args)
     {
@@ -28,10 +32,15 @@ internal static class Program
             return 2;
         }
 
+        if (options.Mode == EvaluateMode)
+        {
+            return RunEvaluation(options);
+        }
+
         var strategy = Strategies.FirstOrDefault(s => s.Name == options.Mode);
         if (strategy is null)
         {
-            Console.Error.WriteLine($"Unknown mode '{options.Mode}'. Supported: {string.Join(", ", Strategies.Select(s => s.Name))}.");
+            Console.Error.WriteLine($"Unknown mode '{options.Mode}'. Supported: {string.Join(", ", Strategies.Select(s => s.Name))}, {EvaluateMode}.");
             return 2;
         }
 
@@ -101,6 +110,51 @@ internal static class Program
         Console.WriteLine($"Saved results to {outputPath}");
         return 0;
     }
+
+    /// <summary>
+    /// Scores every known verdict column found in the input file and prints / saves the metrics.
+    /// </summary>
+    private static int RunEvaluation(RunOptions options)
+    {
+        var inputPath = options.InputPath ?? "few_shot_results.csv";
+        var outputPath = options.OutputPath ?? "metrics.csv";
+
+        if (!File.Exists(inputPath))
+        {
+            Console.Error.WriteLine($"Input file not found: {inputPath}");
+            return 1;
+        }
+
+        var findings = CsvTable.LoadFindings(inputPath);
+        var present = Evaluator.KnownRuns
+            .Where(run => findings.Any(f => f.Columns.ContainsKey(run.Column)))
+            .ToList();
+
+        if (present.Count == 0)
+        {
+            Console.Error.WriteLine("No verdict columns found. Expected LlmVerdict and/or LlmVerdict_FewShot.");
+            return 1;
+        }
+
+        var allRows = new List<MetricsRow>();
+        foreach (var (column, run) in present)
+        {
+            var rows = Evaluator.Score(findings, column, run, out int unresolved, out int unlabelled);
+            allRows.AddRange(rows);
+
+            Console.WriteLine($"=== {run} ({column}) ===");
+            Console.Write(Evaluator.FormatTable(rows));
+            if (unlabelled > 0)
+                Console.WriteLine($"Note: {unlabelled} row(s) skipped because GroundTruth is not TP or FP.");
+            if (unresolved > 0)
+                Console.WriteLine($"Note: {unresolved} verdict(s) were ERROR/UNCLEAR and counted as a negative prediction.");
+            Console.WriteLine();
+        }
+
+        Evaluator.SaveCsv(outputPath, allRows);
+        Console.WriteLine($"Saved metrics to {outputPath}");
+        return 0;
+    }
 }
 
 internal sealed record RunOptions(
@@ -151,16 +205,17 @@ internal sealed record RunOptions(
         Console.WriteLine($"""
             Usage: triage-runner [options]
 
-              --mode <name>           {string.Join(" | ", strategies.Select(s => s.Name))}. Default: zero-shot
+              --mode <name>           {string.Join(" | ", strategies.Select(s => s.Name))} | evaluate. Default: zero-shot
               --input <path>          Findings CSV. Default depends on mode:
             {string.Join("\n", strategies.Select(s => $"                          {s.Name}: {s.DefaultInput}"))}
-              --output <path>         Results CSV. Default: <mode>_results.csv
+                                      evaluate: few_shot_results.csv
+              --output <path>         Results CSV. Default: <mode>_results.csv (evaluate: metrics.csv)
               --delay-ms <ms>         Pause between API calls. Default: 2100
               --retry-wait-ms <ms>    Wait after a rate-limit reply (few-shot only). Default: 15000
               --endpoint <url>        Override the chat completions URL (testing only)
 
             Environment:
-              GROQ_API_KEY            Required. Your Groq API key.
+              GROQ_API_KEY            Required for zero-shot and few-shot. Not needed for evaluate.
             """);
     }
 }

@@ -1,0 +1,80 @@
+# Security scanning pipeline for the LLM triage study.
+#
+# Clones the target application, runs three scanners against it and merges
+# their findings into one CSV ready for manual labelling:
+#   SAST          Semgrep
+#   Secrets       Gitleaks
+#   Dependencies  OSV.dev vulnerability database
+#
+# Output: a "scan-results" build artifact containing the raw JSON reports
+# and labeled_with_groundtruth.csv (GroundTruth and Reason left blank).
+
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  TARGET_REPO: 'https://github.com/anil-yelken/Vulnerable-Flask-App.git'
+  TARGET_DIR: '$(Pipeline.Workspace)/target'
+  REPORTS: '$(Build.ArtifactStagingDirectory)'
+  SCRIPTS: '$(Build.SourcesDirectory)/scripts'
+  GITLEAKS_VERSION: '8.18.4'
+
+steps:
+
+  - task: UsePythonVersion@0
+    displayName: 'Use Python 3.11'
+    inputs:
+      versionSpec: '3.11'
+
+  - script: |
+      python -m pip install --upgrade pip
+      pip install semgrep requests
+    displayName: 'Install Semgrep and Python dependencies'
+
+  - script: |
+      curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v$(GITLEAKS_VERSION)/gitleaks_$(GITLEAKS_VERSION)_linux_x64.tar.gz" -o gitleaks.tar.gz
+      tar -xzf gitleaks.tar.gz gitleaks
+      sudo mv gitleaks /usr/local/bin/
+      gitleaks version
+    displayName: 'Install Gitleaks'
+
+  - script: git clone --depth 1 "$(TARGET_REPO)" "$(TARGET_DIR)"
+    displayName: 'Fetch target application'
+
+  # Scanners report findings through non-zero exit codes, so each scan
+  # is allowed to "fail" without stopping the pipeline.
+
+  - script: semgrep --config auto --json --output "$(REPORTS)/semgrep-results.json" .
+    displayName: 'SAST scan (Semgrep)'
+    workingDirectory: '$(TARGET_DIR)'
+    continueOnError: true
+
+  - script: gitleaks detect --source . --no-git --report-format json --report-path "$(REPORTS)/gitleaks-results.json"
+    displayName: 'Secrets scan (Gitleaks)'
+    workingDirectory: '$(TARGET_DIR)'
+    continueOnError: true
+
+  - script: python "$(SCRIPTS)/osv_scan.py" --requirements app/requirements.txt --output "$(REPORTS)/dependency-results.json"
+    displayName: 'Dependency scan (OSV.dev)'
+    workingDirectory: '$(TARGET_DIR)'
+    continueOnError: true
+
+  - script: >
+      python "$(SCRIPTS)/build_dataset.py"
+      --semgrep "$(REPORTS)/semgrep-results.json"
+      --gitleaks "$(REPORTS)/gitleaks-results.json"
+      --dependency "$(REPORTS)/dependency-results.json"
+      --output "$(REPORTS)/labeled_with_groundtruth.csv"
+    displayName: 'Build labelling dataset'
+    continueOnError: true
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish scan results'
+    inputs:
+      PathtoPublish: '$(REPORTS)'
+      ArtifactName: 'scan-results'
